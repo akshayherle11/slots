@@ -1,0 +1,712 @@
+openapi: 3.0.3
+info:
+  title: Slots API
+  version: 1.0.0
+  description: |
+    Create users and time slots, and book or cancel slots.
+
+    **Conventions**
+    - All request and response bodies are JSON (`Content-Type: application/json`).
+    - Timestamps are RFC 3339 (e.g. `2026-10-10T10:00:00Z`). Responses may render the same
+      instant in the server's time zone (e.g. `2026-10-10T15:30:00+05:30`), so parse them as
+      instants rather than comparing strings.
+    - Every error response has the shape `{"error": "<message>"}`.
+    - Slot `status` is `0` (not booked), `50` (on hold) or `100` (booked).
+
+    **Holds**: `POST /slots/{id}/hold` reserves a free slot for `booking.holdMinutes` (server
+    config), counted from the slot's last update. Active holds carry `holdExpiresAt`. Once a
+    hold expires the API shows the slot as not booked everywhere and anyone can hold or book
+    it; the database row is not rewritten. While active, only the holder can book (confirm)
+    or cancel (release) it; others get `409 slot is on hold`.
+
+    **Booking concurrency**: when several users book the same slot at the same time, exactly
+    one request succeeds (`200`); the others get `409` with `"slot is already booked"`.
+    The UI should treat `409` on book as "someone else got it" and refresh the slot list.
+
+    **History**: every successful book, cancel and reschedule is recorded and can be read
+    with `GET /users/{id}/history`.
+servers:
+  - url: http://localhost:4500
+    description: Local
+
+# No authentication yet; userId is passed in the request body.
+security: []
+
+tags:
+  - name: Users
+  - name: Slots
+  - name: Health
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Health check
+      operationId: health
+      responses:
+        "200":
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /users:
+    post:
+      tags: [Users]
+      summary: Create a user
+      description: Name is trimmed; email is trimmed and lower-cased before saving.
+      operationId: createUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateUserRequest"
+      responses:
+        "201":
+          description: User created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: A user with this email already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: record already exists
+
+  /users/{id}:
+    get:
+      tags: [Users]
+      summary: Get a user by id
+      operationId: getUser
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: The user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "400":
+          $ref: "#/components/responses/InvalidId"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /users/{id}/history:
+    get:
+      tags: [Users]
+      summary: Get a user's booking history
+      description: |
+        Every booking change the user made, **newest first**: bookings, cancellations
+        (`unbooked`) and reschedules. Failed attempts are not recorded.
+
+        Each entry embeds the `slot` (and, for reschedules, the `previousSlot`) as it is
+        **now**, not as it was when the change happened, so use `action` to know what
+        happened rather than the embedded slot's `status`.
+      operationId: getUserHistory
+      parameters:
+        - $ref: "#/components/parameters/Id"
+        - name: limit
+          in: query
+          required: false
+          description: Max entries to return (default 50).
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: offset
+          in: query
+          required: false
+          description: Entries to skip, for paging (default 0).
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        "200":
+          description: History entries, newest first. `[]` if there are none.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SlotHistory"
+        "400":
+          description: |
+            Invalid `id`, or bad paging: `"invalid limit"`, `"invalid offset"` (not an
+            integer), `"limit must be between 1 and 200"`, `"offset must not be negative"`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: limit must be between 1 and 200
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /slots:
+    get:
+      tags: [Slots]
+      summary: List all slots
+      description: Ordered by `date`, then `from`. Returns `[]` when there are none.
+      operationId: listSlots
+      responses:
+        "200":
+          description: All slots
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Slot"
+    post:
+      tags: [Slots]
+      summary: Create a slot
+      description: "New slots are always created unbooked (`status: 0`, no `bookedBy`)."
+      operationId: createSlot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSlotRequest"
+      responses:
+        "201":
+          description: Slot created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Slot"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /slots/bulk:
+    post:
+      tags: [Slots]
+      summary: Create several slots at once
+      description: |
+        All-or-nothing: if any slot is invalid or the insert fails, none are created.
+        Validation errors name the failing item, e.g. `"slots[1]: from must be before to"`.
+      operationId: createSlotsBulk
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSlotsBulkRequest"
+      responses:
+        "201":
+          description: Slots created, in request order
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Slot"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /slots/{id}:
+    get:
+      tags: [Slots]
+      summary: Get a slot by id
+      operationId: getSlot
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: The slot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Slot"
+        "400":
+          $ref: "#/components/responses/InvalidId"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /slots/{id}/hold:
+    post:
+      tags: [Slots]
+      summary: Put a slot on hold
+      description: |
+        Holds the slot for `userId` for `booking.holdMinutes`. The slot must be free or have an
+        expired hold. Confirm with `/book`, release with `/cancel`. Safe under concurrency:
+        only one of several simultaneous holds succeeds.
+      operationId: holdSlot
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BookingRequest"
+      responses:
+        "200":
+          description: Slot held (`status` 50, with `bookedBy` and `holdExpiresAt`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Slot"
+              example:
+                id: 1
+                date: "2026-10-10T00:00:00Z"
+                from: "2026-10-10T10:00:00Z"
+                to: "2026-10-10T11:00:00Z"
+                status: 50
+                bookedBy: 2
+                createdAt: "2026-10-08T12:10:02Z"
+                updatedAt: "2026-10-08T12:10:05Z"
+                holdExpiresAt: "2026-10-08T12:20:05Z"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          description: Slot or user does not exist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: record not found
+        "409":
+          description: |
+            The slot is booked (`"slot is already booked"`), has an active hold - anyone's,
+            including the caller's (`"slot is on hold"`), or changed while the request was in
+            flight (`"slot was modified concurrently, retry"`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: slot is on hold
+
+  /slots/{id}/book:
+    post:
+      tags: [Slots]
+      summary: Book a slot (or confirm your hold)
+      description: |
+        Books the slot for `userId`. Works on a free slot, an expired hold, or a slot the same
+        user is holding (confirms the hold). Safe under concurrency: only one of several
+        simultaneous bookings for the same slot succeeds.
+      operationId: bookSlot
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BookingRequest"
+      responses:
+        "200":
+          description: Slot booked
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Slot"
+              example:
+                id: 1
+                date: "2026-10-10T00:00:00Z"
+                from: "2026-10-10T10:00:00Z"
+                to: "2026-10-10T11:00:00Z"
+                status: 100
+                bookedBy: 2
+                createdAt: "2026-10-08T12:10:02Z"
+                updatedAt: "2026-10-08T12:10:05Z"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          description: Slot or user does not exist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: record not found
+        "409":
+          description: |
+            The slot is already booked (`"slot is already booked"`), another user has an active
+            hold on it (`"slot is on hold"`), or it changed while this request was in flight
+            (`"slot was modified concurrently, retry"`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: slot is already booked
+
+  /slots/{id}/cancel:
+    post:
+      tags: [Slots]
+      summary: Cancel a booking or release a hold
+      description: Only the user who booked or is holding the slot can cancel it.
+      operationId: cancelSlot
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BookingRequest"
+      responses:
+        "200":
+          description: "Booking cancelled; slot is free again (`status: 0`, no `bookedBy`)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Slot"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: The slot is booked or held by a different user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: slot is booked by another user
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: |
+            The slot is free, including an expired hold (`"slot is not booked"`), or it changed
+            while this request was in flight (`"slot was modified concurrently, retry"`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: slot is not booked
+
+  /slots/{id}/reschedule:
+    post:
+      tags: [Slots]
+      summary: Move a booking to another slot
+      description: |
+        Moves the user's booking from slot `{id}` to `toSlotId` in one step: the old slot is
+        freed and the new one booked, or nothing changes. Only the user who **booked** `{id}`
+        can reschedule it (holds can't be rescheduled). The target may be free, an expired
+        hold, or a slot the same user is holding. Safe under concurrency: if two users reschedule into the same free
+        slot at once, exactly one succeeds and the other keeps their original slot.
+      operationId: rescheduleSlot
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RescheduleRequest"
+      responses:
+        "200":
+          description: Rescheduled. Returns the **new** slot, now booked by the user.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Slot"
+        "400":
+          description: |
+            Invalid `id` or body, or `toSlotId` equals `{id}`
+            (`"cannot reschedule to the same slot"`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: cannot reschedule to the same slot
+        "403":
+          description: Slot `{id}` is booked by a different user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: slot is booked by another user
+        "404":
+          description: Either slot does not exist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: record not found
+        "409":
+          description: |
+            Slot `{id}` is not booked (`"slot is not booked"`), the target slot is booked
+            (`"slot is already booked"`) or held by another user (`"slot is on hold"`), or a slot changed while the request was in flight
+            (`"slot was modified concurrently, retry"`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: slot is already booked
+
+components:
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      description: Positive integer id
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+
+  responses:
+    BadRequest:
+      description: |
+        Invalid request body. Messages come from validation, e.g. `"from must be before to"`,
+        `"email is invalid"`, `"date must be in YYYY-MM-DD format"`, or a field-binding message
+        such as `"Key: 'createUserRequest.Name' Error:Field validation for 'Name' failed on the 'required' tag"`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: from must be before to
+    InvalidId:
+      description: The `id` path parameter is not a positive integer
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: invalid id
+    NotFound:
+      description: No record with this id
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: record not found
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+    User:
+      type: object
+      required: [id, name, email]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 1
+        name:
+          type: string
+          example: Asha
+        email:
+          type: string
+          format: email
+          example: asha@example.com
+
+    CreateUserRequest:
+      type: object
+      required: [name, email]
+      properties:
+        name:
+          type: string
+          maxLength: 255
+          example: Asha
+        email:
+          type: string
+          format: email
+          maxLength: 255
+          example: asha@example.com
+
+    SlotStatus:
+      type: integer
+      enum: [0, 50, 100]
+      description: "`0` = not booked, `50` = on hold, `100` = booked. An expired hold is returned as `0`."
+
+    Slot:
+      type: object
+      required: [id, date, from, to, status, createdAt, updatedAt]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 1
+        date:
+          type: string
+          format: date-time
+          description: Calendar day of the slot, returned as midnight UTC (e.g. `2026-10-10T00:00:00Z`).
+          example: "2026-10-10T00:00:00Z"
+        from:
+          type: string
+          format: date-time
+          example: "2026-10-10T10:00:00Z"
+        to:
+          type: string
+          format: date-time
+          example: "2026-10-10T11:00:00Z"
+        status:
+          $ref: "#/components/schemas/SlotStatus"
+        bookedBy:
+          type: integer
+          format: int64
+          description: Id of the user who booked or is holding the slot. **Omitted** when the slot is not booked.
+          example: 2
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        holdExpiresAt:
+          type: string
+          format: date-time
+          description: When the hold ends. **Only present** while `status` is `50`.
+
+    CreateSlotRequest:
+      type: object
+      required: [date, from, to]
+      properties:
+        date:
+          type: string
+          format: date
+          description: "`YYYY-MM-DD`"
+          example: "2026-10-10"
+        from:
+          type: string
+          format: date-time
+          description: RFC 3339; must be before `to`.
+          example: "2026-10-10T10:00:00Z"
+        to:
+          type: string
+          format: date-time
+          description: RFC 3339
+          example: "2026-10-10T11:00:00Z"
+
+    CreateSlotsBulkRequest:
+      type: object
+      required: [slots]
+      properties:
+        slots:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/CreateSlotRequest"
+      example:
+        slots:
+          - date: "2026-10-11"
+            from: "2026-10-11T10:00:00Z"
+            to: "2026-10-11T11:00:00Z"
+          - date: "2026-10-11"
+            from: "2026-10-11T11:00:00Z"
+            to: "2026-10-11T12:00:00Z"
+
+    BookingRequest:
+      type: object
+      required: [userId]
+      properties:
+        userId:
+          type: integer
+          format: int64
+          minimum: 1
+          example: 2
+
+    RescheduleRequest:
+      type: object
+      required: [userId, toSlotId]
+      properties:
+        userId:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Must be the user who booked slot `{id}`.
+          example: 1
+        toSlotId:
+          type: integer
+          format: int64
+          minimum: 1
+          description: The free slot to move the booking to.
+          example: 2
+
+    SlotAction:
+      type: integer
+      enum: [1, 2, 3, 4]
+      description: "`1` = booked, `2` = unbooked (cancelled or hold released), `3` = rescheduled, `4` = held"
+
+    SlotHistory:
+      type: object
+      required: [id, userId, slotId, action, createdAt]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 2
+        userId:
+          type: integer
+          format: int64
+          example: 1
+        slotId:
+          type: integer
+          format: int64
+          description: The slot acted on. For a reschedule, the slot moved **to**.
+          example: 2
+        previousSlotId:
+          type: integer
+          format: int64
+          description: For a reschedule, the slot moved **from**. Omitted for other actions.
+          example: 1
+        action:
+          $ref: "#/components/schemas/SlotAction"
+        createdAt:
+          type: string
+          format: date-time
+          description: When the change happened.
+        slot:
+          allOf:
+            - $ref: "#/components/schemas/Slot"
+          description: Current state of `slotId`.
+        previousSlot:
+          allOf:
+            - $ref: "#/components/schemas/Slot"
+          description: Current state of `previousSlotId`. Present only for reschedules.
+      example:
+        id: 2
+        userId: 1
+        slotId: 2
+        previousSlotId: 1
+        action: 3
+        createdAt: "2026-10-08T12:33:52Z"
+        slot:
+          id: 2
+          date: "2026-10-10T00:00:00Z"
+          from: "2026-10-10T11:00:00Z"
+          to: "2026-10-10T12:00:00Z"
+          status: 100
+          bookedBy: 1
+          createdAt: "2026-10-08T12:33:50Z"
+          updatedAt: "2026-10-08T12:33:52Z"
+        previousSlot:
+          id: 1
+          date: "2026-10-10T00:00:00Z"
+          from: "2026-10-10T10:00:00Z"
+          to: "2026-10-10T11:00:00Z"
+          status: 0
+          createdAt: "2026-10-08T12:33:50Z"
+          updatedAt: "2026-10-08T12:33:52Z"

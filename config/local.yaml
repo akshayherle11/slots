@@ -1,0 +1,13 @@
+server:
+  port: 4500
+
+db:
+  host: localhost
+  port: 5432
+  user: postgres
+  password: ""
+  name: slots
+  sslmode: disable
+
+booking:
+  holdMinutes: 10
